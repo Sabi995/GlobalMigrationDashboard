@@ -7,6 +7,7 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from config import GOOGLE_PLACES_API_KEY
@@ -15,7 +16,7 @@ except ImportError:
     GOOGLE_PLACES_API_KEY = None
 
 # Constants
-TARGET_CITIES = [
+DEFAULT_TARGET_CITIES = [
     # US Cities
     "Tampa, FL", "Memphis, TN", "Cleveland, OH",
     "Philadelphia, PA", "Las Vegas, NV", "Atlanta, GA",
@@ -27,9 +28,11 @@ TARGET_CITIES = [
 ]
 
 FREE_PLATFORMS = ["weebly", "wix", "squarespace", "ecatholic"]
+CHURCH_LIMIT_PER_CITY = 60 # Increased limit to get more results through pagination
 
 OUTPUT_DIR = "output"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "leads.csv")
+CITIES_FILE = "cities.txt"
 
 import time
 
@@ -226,17 +229,79 @@ def generate_dm_message(church_name, priority):
 
     return msg
 
+def process_church(place, city):
+    """Worker function to process a single church in parallel."""
+    details = get_church_details(place["place_id"])
+    if not details:
+        return None
+
+    # Evaluate website
+    evaluation = evaluate_website(details["website"])
+
+    # Update email if found on website
+    if evaluation["email"] != "N/A":
+        details["email"] = evaluation["email"]
+
+    # Determine priority
+    priority = determine_priority(evaluation)
+
+    # Generate DM
+    dm_message = generate_dm_message(details["name"], priority)
+
+    # Parse city/state for the CSV
+    try:
+        parts = city.split(',')
+        city_name = parts[0].strip()
+        state_name = parts[1].strip() if len(parts) > 1 else ""
+    except Exception:
+        city_name = city
+        state_name = ""
+
+    return {
+        "Church Name": details["name"],
+        "City": city_name,
+        "State": state_name,
+        "Phone": details["phone"],
+        "Email": details["email"],
+        "Website": details["website"] if details["website"] else "N/A",
+        "Website Status": evaluation["status"],
+        "Priority": priority,
+        "Google Maps URL": details["google_maps_url"],
+        "DM Message": dm_message
+    }
+
+def get_target_cities():
+    """Read cities from cities.txt. Auto-generate it with defaults if missing."""
+    if not os.path.exists(CITIES_FILE):
+        print(f"Creating default {CITIES_FILE}...")
+        with open(CITIES_FILE, 'w') as f:
+            for city in DEFAULT_TARGET_CITIES:
+                f.write(f"{city}\n")
+        return DEFAULT_TARGET_CITIES
+
+    with open(CITIES_FILE, 'r') as f:
+        # Read lines, strip whitespace, ignore empty lines
+        cities = [line.strip() for line in f if line.strip()]
+
+    if not cities:
+        print(f"Warning: {CITIES_FILE} is empty. Using default cities.")
+        return DEFAULT_TARGET_CITIES
+
+    return cities
+
 def main():
     ensure_output_dir()
 
     if not GOOGLE_PLACES_API_KEY:
         print("Warning: GOOGLE_PLACES_API_KEY is not set. The script will run but will likely fail API calls.")
 
+    target_cities = get_target_cities()
+
     all_leads = []
 
-    print(f"Starting church hunt in {len(TARGET_CITIES)} cities...")
+    print(f"Starting church hunt in {len(target_cities)} cities (loaded from {CITIES_FILE})...")
 
-    for city in TARGET_CITIES:
+    for city in target_cities:
         print(f"\nSearching in {city}...")
         places = search_churches(city)
 
@@ -248,59 +313,36 @@ def main():
         small_church_places = [p for p in places if p["reviews"] < 75]
         print(f"Found {len(places)} churches. After filtering out large churches, {len(small_church_places)} remain.")
 
-        # Use tqdm for a progress bar
-        for place in tqdm(small_church_places, desc=f"Evaluating {city}"):
-            details = get_church_details(place["place_id"])
-            if not details:
-                continue
+        # Use ThreadPoolExecutor to evaluate multiple websites simultaneously
+        # Using max_workers=10 to parallelize while respecting API rate limits and network resources
+        city_leads_found = 0
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(process_church, place, city): place for place in small_church_places}
 
-            # Evaluate website
-            evaluation = evaluate_website(details["website"])
+            for future in tqdm(as_completed(futures), total=len(small_church_places), desc=f"Evaluating {city}"):
+                lead_data = future.result()
+                if lead_data:
+                    all_leads.append(lead_data)
+                    city_leads_found += 1
 
-            # Update email if found on website
-            if evaluation["email"] != "N/A":
-                details["email"] = evaluation["email"]
+        # Save-As-You-Go after each city to prevent data loss on large runs
+        if all_leads:
+            df = pd.DataFrame(all_leads)
 
-            # Determine priority
-            priority = determine_priority(evaluation)
+            # Sort leads to prioritize "HOT LEAD" (No Website) first
+            priority_order = ["HOT LEAD", "URGENT LEAD", "UPGRADE LEAD", "REDESIGN", "NONE"]
+            df["Priority"] = pd.Categorical(df["Priority"], categories=priority_order, ordered=True)
 
-            # Generate DM
-            dm_message = generate_dm_message(details["name"], priority)
+            # Sort by priority, then city
+            df = df.sort_values(["Priority", "City"])
 
-            # Parse city/state for the CSV
-            city_name, state_name = map(str.strip, city.split(','))
+            df.to_csv(OUTPUT_FILE, index=False)
+            print(f"Saved {city_leads_found} new leads. Total saved to {OUTPUT_FILE}: {len(all_leads)}")
 
-            lead_data = {
-                "Church Name": details["name"],
-                "City": city_name,
-                "State": state_name,
-                "Phone": details["phone"],
-                "Email": details["email"],
-                "Website": details["website"] if details["website"] else "N/A",
-                "Website Status": evaluation["status"],
-                "Priority": priority,
-                "Google Maps URL": details["google_maps_url"],
-                "DM Message": dm_message
-            }
-
-            all_leads.append(lead_data)
-
-    # Save to CSV using pandas
     if all_leads:
-        df = pd.DataFrame(all_leads)
-
-        # Sort leads to prioritize "HOT LEAD" (No Website) first, as that is the core target
-        # Create a categorical data type with an explicit order
-        priority_order = ["HOT LEAD", "URGENT LEAD", "UPGRADE LEAD", "REDESIGN", "NONE"]
-        df["Priority"] = pd.Categorical(df["Priority"], categories=priority_order, ordered=True)
-
-        # Sort by priority, then city
-        df = df.sort_values(["Priority", "City"])
-
-        df.to_csv(OUTPUT_FILE, index=False)
-        print(f"\nSuccess! Found {len(all_leads)} leads. Saved to {OUTPUT_FILE}")
+        print(f"\nFinished processing all cities! Grand total of {len(all_leads)} leads securely saved to {OUTPUT_FILE}")
     else:
-        print("\nNo leads found.")
+        print("\nFinished processing all cities. No leads found.")
 
 if __name__ == "__main__":
     main()
