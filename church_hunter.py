@@ -21,10 +21,12 @@ TARGET_CITIES = [
 ]
 
 FREE_PLATFORMS = ["weebly", "wix", "squarespace", "ecatholic"]
-CHURCH_LIMIT_PER_CITY = 20
+CHURCH_LIMIT_PER_CITY = 60 # Increased limit to get more results through pagination
 
 OUTPUT_DIR = "output"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "leads.csv")
+
+import time
 
 def ensure_output_dir():
     """Ensure the output directory exists."""
@@ -34,6 +36,7 @@ def ensure_output_dir():
 def search_churches(city):
     """
     Search for churches in a specific city using Google Places Text Search API.
+    Handles pagination to fetch more results and filter out mega-churches.
     Returns a list of place_ids.
     """
     if not GOOGLE_PLACES_API_KEY:
@@ -46,14 +49,28 @@ def search_churches(city):
         "key": GOOGLE_PLACES_API_KEY,
     }
 
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        results = response.json().get("results", [])
+    all_results = []
 
-        # Limit to 20 churches per city
-        place_ids = [place["place_id"] for place in results[:CHURCH_LIMIT_PER_CITY]]
-        return place_ids
+    try:
+        while len(all_results) < CHURCH_LIMIT_PER_CITY:
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            results = data.get("results", [])
+            all_results.extend(results)
+
+            next_page_token = data.get("next_page_token")
+            if next_page_token and len(all_results) < CHURCH_LIMIT_PER_CITY:
+                # API requires a short delay before next_page_token becomes valid
+                time.sleep(2)
+                params = {"pagetoken": next_page_token, "key": GOOGLE_PLACES_API_KEY}
+            else:
+                break
+
+        # Return place_ids with their rating count to allow filtering later
+        return [{"place_id": place["place_id"], "reviews": place.get("user_ratings_total", 0)} for place in all_results[:CHURCH_LIMIT_PER_CITY]]
+
     except requests.RequestException as e:
         print(f"Error searching for churches in {city}: {e}")
         return []
@@ -216,17 +233,19 @@ def main():
 
     for city in TARGET_CITIES:
         print(f"\nSearching in {city}...")
-        place_ids = search_churches(city)
+        places = search_churches(city)
 
-        if not place_ids:
+        if not places:
             print(f"No churches found in {city} or API error.")
             continue
 
-        print(f"Found {len(place_ids)} churches. Evaluating...")
+        # Filter for "small" churches (e.g., fewer than 75 reviews) to hit our target demographic
+        small_church_places = [p for p in places if p["reviews"] < 75]
+        print(f"Found {len(places)} churches. After filtering out large churches, {len(small_church_places)} remain.")
 
         # Use tqdm for a progress bar
-        for place_id in tqdm(place_ids, desc=f"Evaluating {city}"):
-            details = get_church_details(place_id)
+        for place in tqdm(small_church_places, desc=f"Evaluating {city}"):
+            details = get_church_details(place["place_id"])
             if not details:
                 continue
 
@@ -264,6 +283,15 @@ def main():
     # Save to CSV using pandas
     if all_leads:
         df = pd.DataFrame(all_leads)
+
+        # Sort leads to prioritize "HOT LEAD" (No Website) first, as that is the core target
+        # Create a categorical data type with an explicit order
+        priority_order = ["HOT LEAD", "URGENT LEAD", "UPGRADE LEAD", "REDESIGN", "NONE"]
+        df["Priority"] = pd.Categorical(df["Priority"], categories=priority_order, ordered=True)
+
+        # Sort by priority, then city
+        df = df.sort_values(["Priority", "City"])
+
         df.to_csv(OUTPUT_FILE, index=False)
         print(f"\nSuccess! Found {len(all_leads)} leads. Saved to {OUTPUT_FILE}")
     else:
