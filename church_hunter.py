@@ -1,6 +1,7 @@
 import os
 import re
 import csv
+import time
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -15,13 +16,17 @@ except ImportError:
 
 # Constants
 TARGET_CITIES = [
+    # US Cities
     "Tampa, FL", "Memphis, TN", "Cleveland, OH",
     "Philadelphia, PA", "Las Vegas, NV", "Atlanta, GA",
-    "Houston, TX", "Chicago, IL", "Dallas, TX", "Detroit, MI"
+    "Houston, TX", "Chicago, IL", "Dallas, TX", "Detroit, MI",
+    # UK Cities
+    "London, UK", "Manchester, UK", "Birmingham, UK",
+    "Liverpool, UK", "Glasgow, UK", "Leeds, UK",
+    "Sheffield, UK", "Bristol, UK", "Edinburgh, UK", "Leicester, UK"
 ]
 
 FREE_PLATFORMS = ["weebly", "wix", "squarespace", "ecatholic"]
-CHURCH_LIMIT_PER_CITY = 60 # Increased limit to get more results through pagination
 
 OUTPUT_DIR = "output"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "leads.csv")
